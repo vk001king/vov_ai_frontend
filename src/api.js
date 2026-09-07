@@ -148,20 +148,33 @@ export const downloadUrl = (name) => `${API_URL}/download/${name}`;
 export const previewUrl = (name) => `${API_URL}/preview/${name}/index.html`;
 
 /**
- * Save the finished project's zip straight to disk, the way a native
- * "Save As" download does - no extra click, no navigating away from
- * the app.
+ * Save a project's zip straight to disk.
+ *
+ * The bytes are fetched first and handed to the browser as a blob
+ * rather than pointing a link at the backend: the backend is a
+ * different origin, where a link would be a real navigation, so a
+ * failed download would replace the whole app with an error page.
+ * This way a failure is just a rejected promise.
  */
-export function triggerDownload(name) {
+export async function downloadProject(name) {
+  const response = await fetch(downloadUrl(name));
+
+  if (!response.ok) {
+    throw new Error(`Download failed (${response.status})`);
+  }
+
+  const href = URL.createObjectURL(await response.blob());
   const link = document.createElement("a");
 
-  link.href = downloadUrl(name);
+  link.href = href;
   link.download = `${name}.zip`;
-  link.rel = "noopener";
 
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+
+  // Give the browser a moment to take the blob before dropping it.
+  setTimeout(() => URL.revokeObjectURL(href), 10000);
 }
 
 /* ---------------- build ---------------- */
@@ -170,17 +183,18 @@ export const startBuild = (payload) =>
   request("/generate", { method: "POST", body: JSON.stringify(payload) });
 
 export const getBuildStatus = (name) => request(`/status/${name}`);
+export const listBuilds = () => request("/status");
 export const cancelBuild = (name) =>
   request(`/cancel/${name}`, { method: "POST" });
 
 /**
- * Watch a build (or fix run) until it finishes. Backed by the
- * backend's own status stream, which - like streamChat above - keeps
- * delivering updates over the network connection itself. The build
- * runs entirely server-side in a background task, so it is unaffected
- * by this watch being throttled, dropped, or never started at all;
- * this just keeps the UI in sync with it. Pass an AbortSignal to stop
- * watching (e.g. when switching away from the project).
+ * Watch a build (or fix run) over the backend's status stream.
+ *
+ * Resolves when the connection closes, which is not necessarily when
+ * the build ends - the server closes an idle stream after a while, and
+ * a backgrounded tab can have its connection dropped. Callers must
+ * re-attach until a status actually reports finished. The build itself
+ * is a server-side background task and keeps running either way.
  */
 export async function watchBuildStatus(name, onUpdate, signal) {
   const response = await fetch(`${API_URL}/status/${name}/stream`, { signal });

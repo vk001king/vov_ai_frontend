@@ -25,6 +25,53 @@ import * as api from "../api.js";
    preview and download a generated project.
    ============================================================ */
 
+const RECONNECT_DELAY_MS = 1000;
+const MAX_STREAM_FAILURES = 5;
+
+/*
+   Projects whose next successful finish should download itself.
+
+   Held in sessionStorage rather than component state so the pending
+   download survives this panel unmounting, the page reloading, or a
+   backgrounded tab being discarded while the build runs on.
+*/
+const PENDING_KEY = "vov_pending_downloads";
+
+function readPending() {
+  try {
+    const raw = sessionStorage.getItem(PENDING_KEY);
+
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writePending(names) {
+  try {
+    sessionStorage.setItem(PENDING_KEY, JSON.stringify([...names]));
+  } catch {
+    /* storage unavailable: downloads simply stay manual */
+  }
+}
+
+function expectDownload(name) {
+  const pending = readPending();
+
+  pending.add(name);
+  writePending(pending);
+}
+
+function claimDownload(name) {
+  const pending = readPending();
+
+  if (!pending.delete(name)) return false;
+
+  writePending(pending);
+
+  return true;
+}
+
 export default function BuilderPanel({ models, model, onModelChange }) {
   const [projects, setProjects] = useState([]);
   const [active, setActive] = useState(null);
@@ -48,7 +95,6 @@ export default function BuilderPanel({ models, model, onModelChange }) {
   const [report, setReport] = useState(null);
 
   const streamRef = useRef(null);
-  const downloadedRef = useRef(new Set());
   const logRef = useRef(null);
 
   /* ---------------- projects ---------------- */
@@ -112,8 +158,14 @@ export default function BuilderPanel({ models, model, onModelChange }) {
     await loadFiles(name);
 
     const current = await api.getBuildStatus(name).catch(() => null);
+    const live = current && current.status !== "not_found" ? current : null;
 
-    setStatus(current && current.status !== "not_found" ? current : null);
+    setStatus(live);
+
+    if (live && !live.finished) {
+      setBusy(true);
+      watchBuild(name);
+    }
   }
 
   /* ---------------- build ---------------- */
@@ -126,15 +178,16 @@ export default function BuilderPanel({ models, model, onModelChange }) {
   }, []);
 
   /**
-   * Watch a build or fix run through to completion over the backend's
-   * status stream. The work itself runs server-side as a background
-   * task - started once and left alone - so this is purely a UI sync:
-   * it keeps the panel current while it can, but the build keeps
-   * going even if this stream is throttled, interrupted, or never
-   * reconnected (e.g. the tab was backgrounded or the page reloaded).
+   * Follow a build or fix run to completion.
    *
-   * On a successful finish the project's zip is downloaded straight
-   * away, no click required.
+   * The work itself is a server-side background task, started once and
+   * left alone; this only keeps the panel in sync with it. The status
+   * stream can end before the build does - the server closes an idle
+   * one, and a backgrounded tab may have its connection dropped - so
+   * re-attach until a status actually reports finished, rather than
+   * leaving the UI stuck mid-build.
+   *
+   * On a successful finish the zip downloads itself, no click needed.
    */
   const watchBuild = useCallback(
     (name, { onFinish } = {}) => {
@@ -143,44 +196,85 @@ export default function BuilderPanel({ models, model, onModelChange }) {
       const controller = new AbortController();
       streamRef.current = controller;
 
-      api
-        .watchBuildStatus(
-          name,
-          (current) => {
-            setStatus(current);
+      let done = false;
 
-            if (!current.finished) return;
+      function handleUpdate(current) {
+        setStatus(current);
 
-            stopWatching();
-            setBusy(false);
+        if (!current.finished || done) return;
 
-            refreshProjects();
-            loadFiles(name);
-            setPreviewKey((value) => value + 1);
+        done = true;
 
-            const succeeded = current.status !== "failed";
+        setBusy(false);
+        refreshProjects();
+        loadFiles(name);
+        setPreviewKey((value) => value + 1);
 
-            if (succeeded && !downloadedRef.current.has(name)) {
-              downloadedRef.current.add(name);
-              api.triggerDownload(name);
+        const succeeded = current.status !== "failed";
+
+        if (succeeded && claimDownload(name)) {
+          api.downloadProject(name).catch((caught) => setError(caught.message));
+        }
+
+        onFinish?.(current, succeeded);
+      }
+
+      (async () => {
+        let failures = 0;
+
+        while (!done && !controller.signal.aborted) {
+          try {
+            await api.watchBuildStatus(name, handleUpdate, controller.signal);
+            failures = 0;
+          } catch (caught) {
+            if (controller.signal.aborted) return;
+
+            failures += 1;
+
+            if (failures >= MAX_STREAM_FAILURES) {
+              setBusy(false);
+              setError(`Lost contact with the build: ${caught.message}`);
+              return;
             }
+          }
 
-            onFinish?.(current, succeeded);
-          },
-          controller.signal
-        )
-        .catch((caught) => {
-          if (controller.signal.aborted) return; // we cancelled it ourselves
+          if (done || controller.signal.aborted) return;
 
-          stopWatching();
-          setBusy(false);
-          setError(caught.message);
-        });
+          await new Promise((resolve) =>
+            setTimeout(resolve, RECONNECT_DELAY_MS)
+          );
+        }
+      })();
     },
     [loadFiles, refreshProjects, stopWatching]
   );
 
   useEffect(() => stopWatching, [stopWatching]);
+
+  // A build started earlier keeps running on the server even if this
+  // panel was unmounted, the tab was backgrounded, or the page was
+  // reloaded. Pick it back up so its progress - and its download - are
+  // not lost.
+  useEffect(() => {
+    let dropped = false;
+
+    (async () => {
+      const data = await api.listBuilds().catch(() => null);
+      const running = data?.builds?.find((build) => !build.finished);
+
+      if (!running || dropped) return;
+
+      setActive(running.project);
+      setProjectName(running.project);
+      setBusy(true);
+      loadFiles(running.project);
+      watchBuild(running.project);
+    })();
+
+    return () => {
+      dropped = true;
+    };
+  }, [loadFiles, watchBuild]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -204,7 +298,7 @@ export default function BuilderPanel({ models, model, onModelChange }) {
     setBusy(true);
     setReport(null);
     setActive(name);
-    downloadedRef.current.delete(name);
+    expectDownload(name);
     setStatus({
       status: "starting",
       message: "Sending request to VOV AI...",
@@ -278,7 +372,7 @@ export default function BuilderPanel({ models, model, onModelChange }) {
     setError("");
     setBusy(true);
     setReport(null);
-    downloadedRef.current.delete(active);
+    expectDownload(active);
 
     try {
       // Just queues the repair as a background task and returns - the
