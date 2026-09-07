@@ -25,8 +25,6 @@ import * as api from "../api.js";
    preview and download a generated project.
    ============================================================ */
 
-const POLL_MS = 900;
-
 export default function BuilderPanel({ models, model, onModelChange }) {
   const [projects, setProjects] = useState([]);
   const [active, setActive] = useState(null);
@@ -49,7 +47,8 @@ export default function BuilderPanel({ models, model, onModelChange }) {
   const [previewKey, setPreviewKey] = useState(0);
   const [report, setReport] = useState(null);
 
-  const pollRef = useRef(null);
+  const streamRef = useRef(null);
+  const downloadedRef = useRef(new Set());
   const logRef = useRef(null);
 
   /* ---------------- projects ---------------- */
@@ -119,43 +118,69 @@ export default function BuilderPanel({ models, model, onModelChange }) {
 
   /* ---------------- build ---------------- */
 
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
+  const stopWatching = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.abort();
+      streamRef.current = null;
     }
   }, []);
 
-  const startPolling = useCallback(
-    (name) => {
-      stopPolling();
+  /**
+   * Watch a build or fix run through to completion over the backend's
+   * status stream. The work itself runs server-side as a background
+   * task - started once and left alone - so this is purely a UI sync:
+   * it keeps the panel current while it can, but the build keeps
+   * going even if this stream is throttled, interrupted, or never
+   * reconnected (e.g. the tab was backgrounded or the page reloaded).
+   *
+   * On a successful finish the project's zip is downloaded straight
+   * away, no click required.
+   */
+  const watchBuild = useCallback(
+    (name, { onFinish } = {}) => {
+      stopWatching();
 
-      pollRef.current = setInterval(async () => {
-        try {
-          const current = await api.getBuildStatus(name);
+      const controller = new AbortController();
+      streamRef.current = controller;
 
-          setStatus(current);
+      api
+        .watchBuildStatus(
+          name,
+          (current) => {
+            setStatus(current);
 
-          if (current.finished) {
-            stopPolling();
+            if (!current.finished) return;
+
+            stopWatching();
             setBusy(false);
 
-            await refreshProjects();
-            await loadFiles(name);
-
+            refreshProjects();
+            loadFiles(name);
             setPreviewKey((value) => value + 1);
-          }
-        } catch (caught) {
-          stopPolling();
+
+            const succeeded = current.status !== "failed";
+
+            if (succeeded && !downloadedRef.current.has(name)) {
+              downloadedRef.current.add(name);
+              api.triggerDownload(name);
+            }
+
+            onFinish?.(current, succeeded);
+          },
+          controller.signal
+        )
+        .catch((caught) => {
+          if (controller.signal.aborted) return; // we cancelled it ourselves
+
+          stopWatching();
           setBusy(false);
           setError(caught.message);
-        }
-      }, POLL_MS);
+        });
     },
-    [loadFiles, refreshProjects, stopPolling]
+    [loadFiles, refreshProjects, stopWatching]
   );
 
-  useEffect(() => stopPolling, [stopPolling]);
+  useEffect(() => stopWatching, [stopWatching]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -179,6 +204,7 @@ export default function BuilderPanel({ models, model, onModelChange }) {
     setBusy(true);
     setReport(null);
     setActive(name);
+    downloadedRef.current.delete(name);
     setStatus({
       status: "starting",
       message: "Sending request to VOV AI...",
@@ -197,7 +223,7 @@ export default function BuilderPanel({ models, model, onModelChange }) {
         auto_fix: autoFix,
       });
 
-      startPolling(name);
+      watchBuild(name);
     } catch (caught) {
       setBusy(false);
       setError(caught.message);
@@ -247,27 +273,31 @@ export default function BuilderPanel({ models, model, onModelChange }) {
   }
 
   async function runFix() {
-    if (!active) return;
+    if (!active || busy) return;
 
+    setError("");
     setBusy(true);
     setReport(null);
+    downloadedRef.current.delete(active);
 
     try {
-      const result = await api.fixProject(active);
+      // Just queues the repair as a background task and returns - the
+      // fix itself can take several model calls, so it keeps running
+      // on the server regardless of whether this tab stays in front.
+      await api.fixProject(active, model);
 
-      setReport({
-        working: result.working,
-        errors: result.errors || [],
-        message: result.message,
-        fixed: result.fixed_files || [],
+      watchBuild(active, {
+        onFinish: (current, succeeded) => {
+          setReport({
+            working: succeeded,
+            errors: current.errors || [],
+            message: current.message,
+          });
+        },
       });
-
-      await loadFiles(active);
-      setPreviewKey((value) => value + 1);
     } catch (caught) {
-      setError(caught.message);
-    } finally {
       setBusy(false);
+      setError(caught.message);
     }
   }
 

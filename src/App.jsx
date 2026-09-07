@@ -1,45 +1,88 @@
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
-import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API_URL = "http://127.0.0.1:8001";
+import * as api from "./api.js";
+import BuilderPanel from "./components/BuilderPanel.jsx";
+import CameraPanel from "./components/CameraPanel.jsx";
+import Composer from "./components/Composer.jsx";
+import Message from "./components/Message.jsx";
+import Sidebar from "./components/Sidebar.jsx";
 
-function App() {
+const SUGGESTIONS = [
+  "Explain how JavaScript promises work, with examples",
+  "Write a Python script that renames files by date",
+  "Build me a landing page for a coffee shop",
+  "Review this code and tell me what could break",
+];
+
+export default function App() {
+  const [view, setView] = useState("chat");
+
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState([]);
-  const [chatHistory, setChatHistory] = useState([]);
+  const [images, setImages] = useState([]);
+
+  const [sessions, setSessions] = useState([]);
+  const [sessionId, setSessionId] = useState(null);
+
   const [model, setModel] = useState("auto");
   const [availableModels, setAvailableModels] = useState([]);
+
   const [loading, setLoading] = useState(false);
   const [backendOnline, setBackendOnline] = useState(false);
+  const [ollamaOnline, setOllamaOnline] = useState(false);
 
   const [cameraOpen, setCameraOpen] = useState(false);
-  const [capturedImage, setCapturedImage] = useState(null);
-  const [cameraError, setCameraError] = useState("");
+  const [inputError, setInputError] = useState("");
 
   const messagesEndRef = useRef(null);
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const fileInputRef = useRef(null);
+  const abortRef = useRef(null);
+
+  /* ---------------- bootstrap ---------------- */
+
+  const checkHealth = useCallback(async () => {
+    try {
+      const health = await api.getHealth();
+
+      setBackendOnline(true);
+      setOllamaOnline(Boolean(health.ollama));
+    } catch {
+      setBackendOnline(false);
+      setOllamaOnline(false);
+    }
+  }, []);
+
+  const loadModels = useCallback(async () => {
+    try {
+      const data = await api.getModels();
+      setAvailableModels(Array.isArray(data.installed) ? data.installed : []);
+    } catch {
+      setAvailableModels([]);
+    }
+  }, []);
+
+  const loadSessions = useCallback(async () => {
+    try {
+      const data = await api.listSessions();
+      setSessions(data.sessions || []);
+    } catch {
+      setSessions([]);
+    }
+  }, []);
 
   useEffect(() => {
-    const savedChats = localStorage.getItem("vov_chat_history");
-
-    if (savedChats) {
-      try {
-        setChatHistory(JSON.parse(savedChats));
-      } catch {
-        setChatHistory([]);
-      }
-    }
-
-    checkBackend();
+    checkHealth();
     loadModels();
+    loadSessions();
+
+    const timer = setInterval(checkHealth, 20000);
 
     return () => {
-      stopCamera();
+      clearInterval(timer);
+      abortRef.current?.abort();
     };
-  }, []);
+  }, [checkHealth, loadModels, loadSessions]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
@@ -48,796 +91,341 @@ function App() {
     });
   }, [messages, loading]);
 
-  useEffect(() => {
-    localStorage.setItem(
-      "vov_chat_history",
-      JSON.stringify(chatHistory)
-    );
-  }, [chatHistory]);
-
-  async function checkBackend() {
-    try {
-      const response = await fetch(`${API_URL}/`);
-
-      setBackendOnline(response.ok);
-    } catch {
-      setBackendOnline(false);
-    }
-  }
-
-  async function loadModels() {
-    try {
-      const response = await fetch(`${API_URL}/models`);
-
-      if (!response.ok) return;
-
-      const data = await response.json();
-
-      if (Array.isArray(data.models)) {
-        setAvailableModels(data.models);
-        return;
-      }
-
-      if (
-        data.models &&
-        Array.isArray(data.models.installed)
-      ) {
-        setAvailableModels(data.models.installed);
-        return;
-      }
-
-      if (Array.isArray(data.installed)) {
-        setAvailableModels(data.installed);
-      }
-    } catch (error) {
-      console.log("Model loading error:", error);
-    }
-  }
+  /* ---------------- sessions ---------------- */
 
   function newChat() {
+    abortRef.current?.abort();
+
     setMessages([]);
     setMessage("");
-    setCapturedImage(null);
+    setImages([]);
+    setSessionId(null);
+    setInputError("");
+    setView("chat");
   }
+
+  async function openSession(id) {
+    try {
+      const data = await api.getSession(id);
+
+      setSessionId(id);
+      setView("chat");
+      setMessages(
+        (data.messages || []).map((item) => ({
+          role: item.role,
+          content: item.content,
+          model: item.model,
+          images: item.images || [],
+        }))
+      );
+    } catch (error) {
+      setInputError(error.message);
+    }
+  }
+
+  async function removeSession(id) {
+    await api.deleteSession(id).catch(() => {});
+
+    if (id === sessionId) newChat();
+
+    loadSessions();
+  }
+
+  async function clearAllSessions() {
+    if (!window.confirm("Delete every saved conversation?")) return;
+
+    await api.clearSessions().catch(() => {});
+
+    newChat();
+    loadSessions();
+  }
+
+  /* ---------------- chat ---------------- */
 
   async function sendMessage() {
     const text = message.trim();
 
-    if (!text || loading) return;
+    if ((!text && images.length === 0) || loading) return;
 
-    const userMessage = {
-      role: "user",
-      content: text,
-      image: capturedImage,
-    };
+    const attached = [...images];
 
-    const updatedMessages = [
-      ...messages,
-      userMessage,
-    ];
+    const outgoing = { role: "user", content: text, images: attached };
 
-    setMessages(updatedMessages);
+    setMessages((current) => [...current, outgoing]);
     setMessage("");
+    setImages([]);
+    setInputError("");
     setLoading(true);
 
-    try {
-      const response = await fetch(
-        `${API_URL}/chat`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            message: text,
-            model: model,
-          }),
+    // Placeholder that fills in as tokens arrive.
+    setMessages((current) => [
+      ...current,
+      { role: "assistant", content: "", thinking: "", model: null, pending: true },
+    ]);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    let currentSession = sessionId;
+    let streamed = false;
+
+    function patchLast(patch) {
+      setMessages((current) => {
+        const copy = [...current];
+        const index = copy.length - 1;
+
+        if (index >= 0 && copy[index].role === "assistant") {
+          copy[index] = { ...copy[index], ...patch(copy[index]) };
         }
+
+        return copy;
+      });
+    }
+
+    try {
+      await api.streamChat(
+        {
+          message: text || "Describe the attached image.",
+          model,
+          session_id: sessionId,
+          images: attached.length ? attached : null,
+        },
+        (chunk) => {
+          if (chunk.type === "session") {
+            currentSession = chunk.session_id;
+            return;
+          }
+
+          if (chunk.type === "thinking") {
+            patchLast((previous) => ({
+              thinking: (previous.thinking || "") + chunk.content,
+              model: chunk.model || previous.model,
+            }));
+            return;
+          }
+
+          if (chunk.type === "content") {
+            streamed = true;
+
+            patchLast((previous) => ({
+              content: (previous.content || "") + chunk.content,
+              model: chunk.model || previous.model,
+              pending: false,
+            }));
+            return;
+          }
+
+          if (chunk.type === "error") {
+            patchLast(() => ({
+              content: chunk.content,
+              error: true,
+              pending: false,
+            }));
+          }
+        },
+        controller.signal
       );
 
-      if (!response.ok) {
-        throw new Error(
-          `Backend error: ${response.status}`
-        );
+      if (!streamed) {
+        patchLast((previous) => ({
+          content:
+            previous.content ||
+            "The model returned an empty response. Try a different model or rephrase.",
+          pending: false,
+        }));
       }
 
-      const data = await response.json();
+      if (currentSession && currentSession !== sessionId) {
+        setSessionId(currentSession);
+      }
 
-      const assistantMessage = {
-        role: "assistant",
-        content:
-          data.response ||
-          "VOV AI did not return a response.",
-        model:
-          data.model ||
-          (model === "auto" ? "Auto" : model),
-      };
-
-      const finalMessages = [
-        ...updatedMessages,
-        assistantMessage,
-      ];
-
-      setMessages(finalMessages);
-
-      setChatHistory((previous) => {
-        const title =
-          text.length > 35
-            ? text.substring(0, 35) + "..."
-            : text;
-
-        const newSavedChat = {
-          id: Date.now(),
-          title,
-          messages: finalMessages,
-        };
-
-        return [
-          newSavedChat,
-          ...previous,
-        ];
-      });
-
-      setCapturedImage(null);
+      loadSessions();
     } catch (error) {
-      console.error(error);
-
-      const errorMessage = {
-        role: "assistant",
-        content:
-          "I couldn't connect to the VOV AI backend. Make sure FastAPI is running on port 8001.",
-        model: "System",
-      };
-
-      setMessages((previous) => [
-        ...previous,
-        errorMessage,
-      ]);
+      if (error.name === "AbortError") {
+        patchLast((previous) => ({
+          content: previous.content || "_Stopped._",
+          pending: false,
+        }));
+      } else {
+        patchLast(() => ({
+          content:
+            `Could not reach the VOV AI backend at ${api.API_URL}. ` +
+            "Start it with `python main.py` in the backend folder, " +
+            "and make sure Ollama is running.",
+          error: true,
+          pending: false,
+        }));
+      }
     } finally {
       setLoading(false);
-      checkBackend();
+      abortRef.current = null;
+      checkHealth();
     }
   }
 
-  function handleKeyDown(event) {
-    if (
-      event.key === "Enter" &&
-      !event.shiftKey
-    ) {
-      event.preventDefault();
-      sendMessage();
-    }
+  function stopGeneration() {
+    abortRef.current?.abort();
   }
 
-  function openChat(chat) {
-    setMessages(chat.messages || []);
-    setMessage("");
-  }
+  /* ---------------- render ---------------- */
 
-  function deleteHistory() {
-    localStorage.removeItem("vov_chat_history");
-    setChatHistory([]);
-  }
-
-  function useSuggestion(text) {
-    setMessage(text);
-  }
-
-  function getModelName(item) {
-    if (typeof item === "string") return item;
-    if (item?.name) return item.name;
-    if (item?.model) return item.model;
-    return null;
-  }
-
-  /* ============================================================
-     CAMERA
-     ============================================================ */
-
-  async function startCamera() {
-    setCameraError("");
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError(
-        "Camera is not supported by this browser."
-      );
-      return;
-    }
-
-    try {
-      const stream =
-        await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "user",
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        });
-
-      streamRef.current = stream;
-      setCameraOpen(true);
-
-      setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      }, 50);
-    } catch (error) {
-      console.error(error);
-
-      setCameraError(
-        "Camera permission was denied or the camera is unavailable."
-      );
-    }
-  }
-
-  function stopCamera() {
-    if (streamRef.current) {
-      streamRef.current
-        .getTracks()
-        .forEach((track) => track.stop());
-
-      streamRef.current = null;
-    }
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
-    setCameraOpen(false);
-  }
-
-  function captureImage() {
-    const video = videoRef.current;
-
-    if (!video || !video.videoWidth) {
-      setCameraError("Camera is not ready yet.");
-      return;
-    }
-
-    const canvas = document.createElement("canvas");
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    const context = canvas.getContext("2d");
-
-    context.drawImage(
-      video,
-      0,
-      0,
-      canvas.width,
-      canvas.height
-    );
-
-    const image = canvas.toDataURL(
-      "image/jpeg",
-      0.88
-    );
-
-    setCapturedImage(image);
-    stopCamera();
-  }
-
-  function handleImageUpload(event) {
-    const file = event.target.files?.[0];
-
-    if (!file) return;
-
-    if (!file.type.startsWith("image/")) {
-      setCameraError("Please select an image file.");
-      return;
-    }
-
-    const reader = new FileReader();
-
-    reader.onload = () => {
-      setCapturedImage(reader.result);
-      setCameraError("");
-    };
-
-    reader.readAsDataURL(file);
-
-    event.target.value = "";
-  }
-
-  function removeImage() {
-    setCapturedImage(null);
-  }
+  const lastMessage = messages[messages.length - 1];
+  const waiting = loading && lastMessage?.pending;
 
   return (
     <div className="app">
-
-      {/* ======================================================
-          SIDEBAR
-          ====================================================== */}
-
-      <aside className="sidebar">
-
-        <div className="cyberLines" />
-
-        <div className="brand">
-          <div className="brandMark">V</div>
-
-          <div>
-            <div className="brandName">
-              VOV AI
-            </div>
-
-            <div className="brandSub">
-              VISUAL INTELLIGENCE
-            </div>
-          </div>
-        </div>
-
-        <button
-          className="newChatButton"
-          onClick={newChat}
-        >
-          <span>+</span>
-          New chat
-        </button>
-
-        <div className="historyHeader">
-          <span>Chat history</span>
-
-          {chatHistory.length > 0 && (
-            <button
-              className="clearButton"
-              onClick={deleteHistory}
-            >
-              Clear
-            </button>
-          )}
-        </div>
-
-        <div className="historyList">
-          {chatHistory.length === 0 ? (
-            <div className="noHistory">
-              Your conversations will appear here.
-            </div>
-          ) : (
-            chatHistory.map((chat) => (
-              <button
-                key={chat.id}
-                className="historyItem"
-                onClick={() => openChat(chat)}
-              >
-                <span className="historyIcon">
-                  ◈
-                </span>
-
-                <span className="historyTitle">
-                  {chat.title}
-                </span>
-              </button>
-            ))
-          )}
-        </div>
-
-        <div className="sidebarBottom">
-          <div className="connection">
-            <span
-              className={
-                backendOnline
-                  ? "connectionDot online"
-                  : "connectionDot offline"
-              }
-            />
-
-            <span>
-              {backendOnline
-                ? "SYSTEM ONLINE"
-                : "SYSTEM OFFLINE"}
-            </span>
-          </div>
-
-          <div className="localText">
-            VOV AI • LOCAL CORE
-          </div>
-        </div>
-      </aside>
-
-      {/* ======================================================
-          MAIN
-          ====================================================== */}
+      <Sidebar
+        view={view}
+        onChangeView={setView}
+        sessions={sessions}
+        activeSessionId={sessionId}
+        onNewChat={newChat}
+        onOpenSession={openSession}
+        onDeleteSession={removeSession}
+        onClearSessions={clearAllSessions}
+        backendOnline={backendOnline}
+        ollamaOnline={ollamaOnline}
+        modelCount={availableModels.length}
+      />
 
       <main className="main">
-
         <div className="scanline" />
 
-        {/* TOP BAR */}
-
         <header className="topBar">
-
           <div className="topTitle">
-            <div className="statusOrb" />
+            <div className={backendOnline ? "statusOrb" : "statusOrb dim"} />
 
             <div>
               <h1>VOV AI</h1>
-              <span>VISUAL ASSISTANT // ONLINE</span>
+
+              <span>
+                {view === "chat" ? "ASSISTANT" : "PROJECT BUILDER"} //{" "}
+                {ollamaOnline ? "ONLINE" : "OLLAMA OFFLINE"}
+              </span>
             </div>
           </div>
 
           <div className="modelArea">
-            <span className="modelLabel">
-              CORE
-            </span>
+            <span className="modelLabel">CORE</span>
 
             <select
               value={model}
-              onChange={(event) =>
-                setModel(event.target.value)
-              }
+              onChange={(event) => setModel(event.target.value)}
               className="modelSelect"
             >
-              <option value="auto">
-                AUTO
-              </option>
+              <option value="auto">AUTO</option>
 
-              {availableModels.map((item) => {
-                const modelName =
-                  getModelName(item);
-
-                if (!modelName) return null;
-
-                return (
-                  <option
-                    key={modelName}
-                    value={modelName}
-                  >
-                    {modelName}
-                  </option>
-                );
-              })}
+              {availableModels.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
             </select>
+
+            <button
+              className="refreshModels"
+              title="Refresh model list"
+              onClick={async () => {
+                await api.getModels(true).catch(() => {});
+                loadModels();
+                checkHealth();
+              }}
+            >
+              ↻
+            </button>
           </div>
         </header>
 
-        {/* ======================================================
-            CHAT
-            ====================================================== */}
+        {!backendOnline && (
+          <div className="offlineBanner">
+            Backend unreachable at {api.API_URL} — run{" "}
+            <code>python main.py</code> in the backend folder.
+          </div>
+        )}
 
-        <section className="chatArea">
+        {view === "builder" ? (
+          <BuilderPanel
+            models={availableModels}
+            model={model}
+            onModelChange={setModel}
+          />
+        ) : (
+          <>
+            <section className="chatArea">
+              {messages.length === 0 ? (
+                <div className="welcome">
+                  <div className="assistantCore">
+                    <div className="coreRing ringOne" />
+                    <div className="coreRing ringTwo" />
+                    <div className="coreRing ringThree" />
+                    <div className="coreSphere">V</div>
+                  </div>
 
-          {messages.length === 0 ? (
+                  <div className="systemLabel">LOCAL ASSISTANT</div>
 
-            <div className="welcome">
+                  <h2>VOV is ready.</h2>
 
-              <div className="assistantCore">
+                  <p>
+                    Ask a question, attach an image, or switch to the Builder
+                    tab to generate a whole project.
+                  </p>
 
-                <div className="coreRing ringOne" />
-                <div className="coreRing ringTwo" />
-                <div className="coreRing ringThree" />
-
-                <div className="coreSphere">
-                  V
+                  <div className="suggestions">
+                    {SUGGESTIONS.map((text) => (
+                      <button key={text} onClick={() => setMessage(text)}>
+                        {text}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+              ) : (
+                <div className="messages">
+                  {messages.map((item, index) => (
+                    <Message item={item} key={index} />
+                  ))}
 
-              </div>
-
-              <div className="systemLabel">
-                VISUAL ASSISTANT
-              </div>
-
-              <h2>
-                VOV is ready.
-              </h2>
-
-              <p>
-                Talk to VOV, show it an image,
-                or activate your camera.
-              </p>
-
-              <div className="visionActions">
-
-                <button
-                  className="visionButton cameraButton"
-                  onClick={startCamera}
-                >
-                  <span>◉</span>
-                  Camera
-                </button>
-
-                <button
-                  className="visionButton uploadButton"
-                  onClick={() =>
-                    fileInputRef.current?.click()
-                  }
-                >
-                  <span>▣</span>
-                  Upload image
-                </button>
-
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  hidden
-                  onChange={handleImageUpload}
-                />
-
-              </div>
-
-              <div className="suggestions">
-
-                <button
-                  onClick={() =>
-                    useSuggestion(
-                      "What can you help me with?"
-                    )
-                  }
-                >
-                  Ask VOV
-                </button>
-
-                <button
-                  onClick={() =>
-                    useSuggestion(
-                      "Help me understand this image"
-                    )
-                  }
-                >
-                  Analyze image
-                </button>
-
-                <button
-                  onClick={() =>
-                    useSuggestion(
-                      "Help me build something"
-                    )
-                  }
-                >
-                  Build something
-                </button>
-
-              </div>
-
-            </div>
-
-          ) : (
-
-            <div className="messages">
-
-              {messages.map((item, index) => (
-
-                <div
-                  className={`message ${
-                    item.role === "user"
-                      ? "userMessage"
-                      : "assistantMessage"
-                  }`}
-                  key={index}
-                >
-
-                  <div
-                    className={`messageAvatar ${
-                      item.role === "user"
-                        ? "userAvatar"
-                        : "vovAvatar"
-                    }`}
-                  >
-                    {item.role === "user"
-                      ? "U"
-                      : "V"}
-                  </div>
-
-                  <div className="messageBody">
-
-                    <div className="messageHeader">
-                      <strong>
-                        {item.role === "user"
-                          ? "YOU"
-                          : "VOV AI"}
-                      </strong>
-
-                      {item.role ===
-                        "assistant" &&
-                        item.model && (
-                          <span className="modelBadge">
-                            {item.model}
-                          </span>
-                        )}
-                    </div>
-
-                    {item.image && (
-                      <img
-                        className="messageImage"
-                        src={item.image}
-                        alt="Uploaded visual"
-                      />
-                    )}
-
-                    <div className="messageText">
-                      {item.content}
-                    </div>
-
-                  </div>
-
-                </div>
-
-              ))}
-
-              {loading && (
-                <div className="message assistantMessage">
-
-                  <div className="messageAvatar vovAvatar">
-                    V
-                  </div>
-
-                  <div className="messageBody">
-
-                    <div className="messageHeader">
-                      <strong>VOV AI</strong>
-
-                      <span className="modelBadge">
-                        {model === "auto"
-                          ? "AUTO"
-                          : model}
-                      </span>
-                    </div>
-
+                  {waiting && (
                     <div className="thinking">
                       <span className="thinkingDot" />
                       <span className="thinkingDot" />
                       <span className="thinkingDot" />
                       <span>PROCESSING...</span>
                     </div>
+                  )}
 
-                  </div>
+                  <div ref={messagesEndRef} />
                 </div>
               )}
+            </section>
 
-              <div ref={messagesEndRef} />
-
-            </div>
-          )}
-
-        </section>
-
-        {/* ======================================================
-            CAMERA PANEL
-            ====================================================== */}
-
-        {cameraOpen && (
-          <div className="cameraPanel">
-
-            <div className="cameraHeader">
-              <span>
-                ● LIVE VISUAL FEED
-              </span>
-
-              <button
-                onClick={stopCamera}
-              >
-                ×
-              </button>
-            </div>
-
-            <div className="cameraFrame">
-
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
+            {cameraOpen && (
+              <CameraPanel
+                onCapture={(image) => setImages((current) => [...current, image])}
+                onClose={() => setCameraOpen(false)}
+                onError={setInputError}
               />
+            )}
 
-              <div className="cameraCorners" />
-
-              <div className="cameraTarget">
-                <span />
-              </div>
-
-              <div className="cameraScan" />
-
-            </div>
-
-            <button
-              className="captureButton"
-              onClick={captureImage}
-            >
-              <span>◎</span>
-              CAPTURE
-            </button>
-
-          </div>
-        )}
-
-        {/* ======================================================
-            INPUT
-            ====================================================== */}
-
-        <div className="inputContainer">
-
-          {cameraError && (
-            <div className="cameraError">
-              ⚠ {cameraError}
-            </div>
-          )}
-
-          {capturedImage && (
-            <div className="imagePreview">
-
-              <img
-                src={capturedImage}
-                alt="Selected visual"
-              />
-
-              <div className="imagePreviewInfo">
-                <strong>
-                  VISUAL ATTACHED
-                </strong>
-
-                <span>
-                  Ready to reference in your message
-                </span>
-              </div>
-
-              <button
-                onClick={removeImage}
-                title="Remove image"
-              >
-                ×
-              </button>
-
-            </div>
-          )}
-
-          <div className="inputBox">
-
-            <button
-              className="miniVisionButton"
-              onClick={startCamera}
-              title="Open camera"
-            >
-              ◉
-            </button>
-
-            <textarea
-              value={message}
-              onChange={(event) =>
-                setMessage(event.target.value)
+            <Composer
+              message={message}
+              onChangeMessage={setMessage}
+              onSend={sendMessage}
+              onStop={stopGeneration}
+              loading={loading}
+              images={images}
+              onAddImage={(image) => setImages((current) => [...current, image])}
+              onRemoveImage={(index) =>
+                setImages((current) => current.filter((_, i) => i !== index))
               }
-              onKeyDown={handleKeyDown}
-              placeholder={
-                capturedImage
-                  ? "Ask VOV about this visual..."
-                  : "Message VOV AI..."
-              }
-              rows={1}
+              onOpenCamera={() => {
+                setInputError("");
+                setCameraOpen(true);
+              }}
+              error={inputError}
             />
-
-            <button
-              className="sendButton"
-              onClick={sendMessage}
-              disabled={
-                loading ||
-                !message.trim()
-              }
-            >
-              ↑
-            </button>
-
-          </div>
-
-          <div className="inputFooter">
-            <span>
-              ENTER SEND • SHIFT + ENTER NEW LINE
-            </span>
-
-            <span>
-              VOV VISUAL CORE
-            </span>
-          </div>
-
-        </div>
-
+          </>
+        )}
       </main>
     </div>
   );
 }
-
-export default App;
-
